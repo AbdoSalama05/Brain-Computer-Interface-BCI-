@@ -1,102 +1,42 @@
-"""
-BCI Motor Imagery Classification — Streamlit Demo
---------------------------------------------------
-Loads the trained EEGNet model + config produced at the end of Modeling.ipynb
-and lets a user upload one EEG trial (CSV/XLSX with FZ, C3, CZ, C4 columns)
-to get a LEFT / RIGHT prediction with a confidence score.
 
-Expected files (place next to this script, or update the paths below):
-  - eegnet_model.pth     (torch.save(model.state_dict(), ...) from the notebook)
-  - eegnet_config.json   (architecture + channel_order + label_map)
-
-Run with:
-    streamlit run app.py
-"""
 
 import json
 import os
 
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-import torch
-import torch.nn as nn
+from scipy.signal import welch
 
 # --------------------------------------------------------------------------
 # Config / paths
 # --------------------------------------------------------------------------
-MODEL_PATH = "eegnet_model.pth"
-CONFIG_PATH = "eegnet_config.json"
+MODEL_PATH = "lda_band_power_model.joblib"
+SCALER_PATH = "lda_band_power_scaler.joblib"
+CONFIG_PATH = "lda_band_power_config.json"
+
+# The training epochs were 2 seconds at 250Hz = 500 samples. The saved config
+# doesn't store this directly, so it's fixed here to match the notebook.
+EXPECTED_N_SAMPLES = 500
 
 st.set_page_config(page_title="BCI Motor Imagery Demo", page_icon="🧠", layout="centered")
-
-
-# --------------------------------------------------------------------------
-# Model definition (must match the architecture used in Modeling.ipynb)
-# --------------------------------------------------------------------------
-class EEGNet(nn.Module):
-    def __init__(self, n_channels=4, n_samples=500, n_classes=2, dropout=0.5):
-        super(EEGNet, self).__init__()
-
-        F1 = 8
-        D = 2
-        F2 = F1 * D
-        kernel_length = 64
-
-        self.block1 = nn.Sequential(
-            nn.Conv2d(1, F1, kernel_size=(1, kernel_length), padding=(0, kernel_length // 2), bias=False),
-            nn.BatchNorm2d(F1),
-            nn.Conv2d(F1, F1 * D, kernel_size=(n_channels, 1), groups=F1, bias=False),
-            nn.BatchNorm2d(F1 * D),
-            nn.ELU(),
-            nn.AvgPool2d(kernel_size=(1, 4)),
-            nn.Dropout(dropout),
-        )
-
-        self.block2 = nn.Sequential(
-            nn.Conv2d(F1 * D, F1 * D, kernel_size=(1, 16), padding=(0, 8), groups=F1 * D, bias=False),
-            nn.Conv2d(F1 * D, F2, kernel_size=(1, 1), bias=False),
-            nn.BatchNorm2d(F2),
-            nn.ELU(),
-            nn.AvgPool2d(kernel_size=(1, 8)),
-            nn.Dropout(dropout),
-        )
-
-        with torch.no_grad():
-            dummy = torch.zeros(1, 1, n_channels, n_samples)
-            out = self.block2(self.block1(dummy))
-            flat_size = out.view(1, -1).shape[1]
-
-        self.classifier = nn.Linear(flat_size, n_classes)
-
-    def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = x.view(x.size(0), -1)
-        x = self.classifier(x)
-        return x
 
 
 # --------------------------------------------------------------------------
 # Cached loaders
 # --------------------------------------------------------------------------
 @st.cache_resource
-def load_model_and_config():
-    if not os.path.exists(CONFIG_PATH) or not os.path.exists(MODEL_PATH):
-        return None, None
+def load_model_scaler_config():
+    if not os.path.exists(CONFIG_PATH) or not os.path.exists(MODEL_PATH) or not os.path.exists(SCALER_PATH):
+        return None, None, None
 
     with open(CONFIG_PATH, "r") as f:
         config = json.load(f)
 
-    model = EEGNet(
-        n_channels=config["n_channels"],
-        n_samples=config["n_samples"],
-        n_classes=config["n_classes"],
-        dropout=config["dropout"],
-    )
-    model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
-    model.eval()
-    return model, config
+    model = joblib.load(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    return model, scaler, config
 
 
 def load_trial(uploaded_file, channel_order):
@@ -114,28 +54,45 @@ def load_trial(uploaded_file, channel_order):
     return df[channel_order]
 
 
-def preprocess_trial(df, n_samples):
-    """
-    Trim/pad to n_samples and z-score each channel using this trial's own
-    mean/std (no session-level scaler is available at inference time, since
-    that requires the training sessions' fitted statistics).
-    """
-    values = df.values.astype(np.float32)
-
+def fit_to_expected_length(values, n_samples):
+    """Trim/pad a (samples, channels) array to n_samples rows, same as training epochs."""
     if len(values) >= n_samples:
-        values = values[:n_samples]
-    else:
-        pad = np.zeros((n_samples - len(values), values.shape[1]), dtype=np.float32)
-        values = np.vstack([values, pad])
+        return values[:n_samples], False
+    pad = np.zeros((n_samples - len(values), values.shape[1]), dtype=np.float32)
+    return np.vstack([values, pad]), True
 
-    mean = values.mean(axis=0, keepdims=True)
-    std = values.std(axis=0, keepdims=True)
-    std[std == 0] = 1.0
-    values = (values - mean) / std
 
-    # (n_samples, n_channels) -> (1, 1, n_channels, n_samples)
-    reshaped = values.T[np.newaxis, np.newaxis, :, :]
-    return torch.tensor(reshaped, dtype=torch.float32)
+def band_power(signal, fs, low, high, nperseg):
+    f, pxx = welch(signal, fs=fs, nperseg=min(nperseg, len(signal)))
+    mask = (f >= low) & (f <= high)
+    return np.trapezoid(pxx[mask], f[mask])
+
+
+def extract_features(trial_df, config):
+    """
+    Reproduces the exact training pipeline:
+    C3/C4 mu+beta band power -> log1p -> scaler.transform
+    """
+    values = trial_df.values.astype(np.float32)
+    values, was_padded = fit_to_expected_length(values, EXPECTED_N_SAMPLES)
+
+    c3 = values[:, config["c3_index"]]
+    c4 = values[:, config["c4_index"]]
+
+    fs = config["fs"]
+    nperseg = config["welch_nperseg"]
+    mu_lo, mu_hi = config["bands"]["mu"]
+    beta_lo, beta_hi = config["bands"]["beta"]
+
+    c3_mu = band_power(c3, fs, mu_lo, mu_hi, nperseg)
+    c4_mu = band_power(c4, fs, mu_lo, mu_hi, nperseg)
+    c3_beta = band_power(c3, fs, beta_lo, beta_hi, nperseg)
+    c4_beta = band_power(c4, fs, beta_lo, beta_hi, nperseg)
+
+    # order must match config["feature_order"]: ["C3_mu", "C4_mu", "C3_beta", "C4_beta"]
+    raw_features = np.array([[c3_mu, c4_mu, c3_beta, c4_beta]], dtype=np.float64)
+    log_features = np.log1p(raw_features)
+    return log_features, was_padded
 
 
 def make_example_trial(channel_order, n_samples):
@@ -158,33 +115,78 @@ def parse_manual_channel(text):
 # UI
 # --------------------------------------------------------------------------
 st.title("🧠 BCI Motor Imagery Classifier")
-st.caption("EEGNet demo — classifies imagined LEFT vs RIGHT hand movement from EEG")
+st.caption("Band Power + LDA demo, classifies imagined LEFT vs RIGHT hand movement from EEG")
 
-model, config = load_model_and_config()
+model, scaler, config = load_model_scaler_config()
 
 if model is None:
     st.error(
-        f"Couldn't find `{MODEL_PATH}` and/or `{CONFIG_PATH}` in the app folder. "
-        "Copy those two files (produced at the end of Modeling.ipynb) into the same "
+        f"Couldn't find `{MODEL_PATH}`, `{SCALER_PATH}`, and/or `{CONFIG_PATH}` in the app folder. "
+        "Copy those three files (produced at the end of the classical ML notebook) into the same "
         "directory as app.py, then restart the app."
     )
     st.stop()
 
 channel_order = config["channel_order"]
-n_samples = config["n_samples"]
 label_map = config["label_map"]
 inv_label_map = {v: k for k, v in label_map.items()}
 
+split_method = config.get("split_method", "unknown")
+test_accuracy = config.get("test_accuracy", float("nan"))
+st.caption(f"Split method used to select this model: {split_method}. Test accuracy: {test_accuracy:.3f}")
+
 st.divider()
 
+# --------------------------------------------------------------------------
+# Session state: holds the currently loaded trial, so nothing is shown
+# until the user actually uploads a file, clicks the example button, or
+# submits manual values.
+# --------------------------------------------------------------------------
+if "trial_df" not in st.session_state:
+    st.session_state.trial_df = None
+    st.session_state.source_label = None
+
+# --------------------------------------------------------------------------
+# Preview and prediction, shown above the input controls
+# --------------------------------------------------------------------------
+if st.session_state.trial_df is not None:
+    st.subheader("Trial preview")
+    st.caption(st.session_state.source_label)
+    st.line_chart(st.session_state.trial_df.reset_index(drop=True))
+
+    with st.spinner("Running inference..."):
+        features, was_padded = extract_features(st.session_state.trial_df, config)
+        scaled_features = scaler.transform(features)
+        probs = model.predict_proba(scaled_features)[0]
+        pred_idx = int(np.argmax(probs))
+        pred_label = inv_label_map[pred_idx]
+        confidence = probs[pred_idx]
+
+    if was_padded:
+        st.caption(f"Note: input was shorter than {EXPECTED_N_SAMPLES} samples and was zero-padded.")
+
+    st.subheader("Prediction")
+    c1, c2 = st.columns(2)
+    c1.metric("Predicted class", pred_label.upper())
+    c2.metric("Confidence", f"{confidence * 100:.1f}%")
+
+    prob_df = pd.DataFrame(
+        {"Class": [inv_label_map[i].upper() for i in range(len(probs))], "Probability": probs}
+    ).set_index("Class")
+    st.bar_chart(prob_df)
+else:
+    st.info("Upload a trial file or click 'Try example trial' below to see a prediction.")
+
+st.divider()
+
+# --------------------------------------------------------------------------
+# Input controls, shown below the preview
+# --------------------------------------------------------------------------
 input_mode = st.radio(
     "Input method",
     ["Upload CSV/XLSX", "Enter channels manually"],
     horizontal=True,
 )
-
-trial_df = None
-source_label = None
 
 if input_mode == "Upload CSV/XLSX":
     col1, col2 = st.columns([2, 1])
@@ -200,22 +202,23 @@ if input_mode == "Upload CSV/XLSX":
 
     if uploaded_file is not None:
         try:
-            trial_df = load_trial(uploaded_file, channel_order)
-            source_label = f"Uploaded file: {uploaded_file.name}"
+            st.session_state.trial_df = load_trial(uploaded_file, channel_order)
+            st.session_state.source_label = f"Uploaded file: {uploaded_file.name}"
+            st.rerun()
         except Exception as e:
             st.error(str(e))
 
     elif use_example:
-        trial_df = make_example_trial(channel_order, n_samples)
-        source_label = "Synthetic example trial (random noise, for UI demo only)"
+        st.session_state.trial_df = make_example_trial(channel_order, EXPECTED_N_SAMPLES)
+        st.session_state.source_label = "Synthetic example trial (random noise, for UI demo only)"
+        st.rerun()
 
 else:  # Enter channels manually
     st.caption(
-        f"Paste {n_samples} values per channel, separated by commas, spaces, or new lines. "
+        f"Paste up to {EXPECTED_N_SAMPLES} values per channel, separated by commas, spaces, or new lines. "
         "Shorter series are zero-padded; longer ones are trimmed."
     )
     manual_values = {}
-    manual_error = None
 
     fill_example = st.button("Fill with example values")
 
@@ -223,7 +226,7 @@ else:  # Enter channels manually
         default_text = ""
         if fill_example:
             rng = np.random.default_rng()
-            default_text = ", ".join(f"{v:.3f}" for v in rng.normal(0, 1, size=n_samples))
+            default_text = ", ".join(f"{v:.3f}" for v in rng.normal(0, 1, size=EXPECTED_N_SAMPLES))
         manual_values[ch] = st.text_area(f"{ch} values", value=default_text, height=80, key=f"manual_{ch}")
 
     if st.button("Run prediction on manual input", type="primary"):
@@ -232,7 +235,7 @@ else:  # Enter channels manually
             for ch in channel_order:
                 arr = parse_manual_channel(manual_values[ch])
                 if arr is None:
-                    raise ValueError(f"Channel {ch} is empty — paste some values first.")
+                    raise ValueError(f"Channel {ch} is empty. Paste some values first.")
                 parsed[ch] = arr
 
             max_len = max(len(v) for v in parsed.values())
@@ -241,50 +244,24 @@ else:  # Enter channels manually
                 if len(v) < max_len:
                     parsed[ch] = np.pad(v, (0, max_len - len(v)))
 
-            trial_df = pd.DataFrame(parsed)[channel_order]
-            source_label = "Manually entered channel values"
+            st.session_state.trial_df = pd.DataFrame(parsed)[channel_order]
+            st.session_state.source_label = "Manually entered channel values"
+            st.rerun()
         except Exception as e:
             st.error(f"Couldn't parse manual input: {e}")
-
-if trial_df is not None:
-    st.subheader("Trial preview")
-    st.caption(source_label)
-    st.line_chart(trial_df.reset_index(drop=True))
-
-    with st.spinner("Running inference..."):
-        x = preprocess_trial(trial_df, n_samples)
-        with torch.no_grad():
-            logits = model(x)
-            probs = torch.softmax(logits, dim=1).numpy()[0]
-        pred_idx = int(np.argmax(probs))
-        pred_label = inv_label_map[pred_idx]
-        confidence = probs[pred_idx]
-
-    st.subheader("Prediction")
-    c1, c2 = st.columns(2)
-    c1.metric("Predicted class", pred_label.upper())
-    c2.metric("Confidence", f"{confidence * 100:.1f}%")
-
-    prob_df = pd.DataFrame(
-        {"Class": [inv_label_map[i].upper() for i in range(len(probs))], "Probability": probs}
-    ).set_index("Class")
-    st.bar_chart(prob_df)
-
-    st.info(
-        "Remember: with this model, confidence scores do not reflect real predictive "
-        "accuracy (see the warning above). Use this output to demo the pipeline UI, "
-        "not to make claims about EEG-decoded intent.",
-        icon="ℹ️",
-    )
-else:
-    st.info("Upload a trial file or click 'Try example trial' to see a prediction.")
 
 st.divider()
 with st.expander("About this model"):
     st.write(
         f"""
-        - Architecture: EEGNet ({config['n_channels']} channels, {config['n_samples']} samples/epoch)
-        - Channels expected: {', '.join(channel_order)}
-        - Classes: {list(label_map.keys())}
+        Model: {config.get('model_type', 'LinearDiscriminantAnalysis')}
+
+        Features: {', '.join(config.get('feature_order', []))}
+
+        Channels expected: {', '.join(channel_order)}
+
+        Sampling rate: {config.get('fs')} Hz
+
+        Classes: {list(label_map.keys())}
         """
     )

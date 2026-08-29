@@ -1,0 +1,40 @@
+{
+  "split_method": "trial-based (no session grouping)",
+  "test_accuracy": 0.5348314606741573,
+  "test_balanced_accuracy": 0.5325346357625929,
+  "test_f1": 0.4344262295081967,
+  "test_auc": 0.5385450706857451,
+  "model_type": "LinearDiscriminantAnalysis",
+  "feature_order": [
+    "C3_mu",
+    "C4_mu",
+    "C3_beta",
+    "C4_beta"
+  ],
+  "channel_order": [
+    "FZ",
+    "C3",
+    "CZ",
+    "C4"
+  ],
+  "c3_index": 1,
+  "c4_index": 3,
+  "fs": 250,
+  "welch_nperseg": 250,
+  "bands": {
+    "mu": [
+      8,
+      12
+    ],
+    "beta": [
+      13,
+      30
+    ]
+  },
+  "feature_transform": "log1p then StandardScaler (fit on train only)",
+  "label_map": {
+    "Left": 0,
+    "Right": 1
+  },
+  "warning": "selected by highest raw accuracy across trial-based and session-based splits; trial-based split may leak session info across train/test"
+}

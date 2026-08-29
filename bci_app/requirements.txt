@@ -1,5 +1,7 @@
 streamlit
-torch
+scikit-learn
+scipy
+joblib
 numpy
 pandas
 openpyxl
